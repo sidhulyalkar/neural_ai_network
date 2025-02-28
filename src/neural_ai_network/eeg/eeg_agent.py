@@ -240,21 +240,68 @@ class EEGProcessingAgent:
         # Determine file type and use appropriate loader
         _, ext = os.path.splitext(data_path.lower())
         
-        if ext == '.edf':
-            raw = mne.io.read_raw_edf(data_path, preload=True)
-        elif ext == '.bdf':
-            raw = mne.io.read_raw_bdf(data_path, preload=True)
-        elif ext in ['.fif', '.fiff']:
-            raw = mne.io.read_raw_fif(data_path, preload=True)
-        elif ext == '.vhdr':
-            raw = mne.io.read_raw_brainvision(data_path, preload=True)
-        elif ext == '.set':
-            raw = mne.io.read_raw_eeglab(data_path, preload=True)
-        else:
-            raise ValueError(f"Unsupported file format: {ext}")
-        
-        self.logger.info(f"Loaded data: {len(raw.ch_names)} channels, {raw.n_times} samples at {raw.info['sfreq']} Hz")
-        return raw
+        try:
+            # Check if this is an epochs file
+            if "-epo.fif" in data_path or "_epo.fif" in data_path:
+                # Load as epochs
+                self.logger.info("Detected epochs file, loading as epochs")
+                epochs = mne.read_epochs(data_path, preload=True)
+                
+                # Convert epochs to raw (averaging across epochs)
+                # This creates a continuous signal we can work with
+                self.logger.info(f"Converting {len(epochs)} epochs to continuous data")
+                evoked = epochs.average()
+                
+                # Create a raw object from the evoked data
+                info = evoked.info
+                data = evoked.data
+                
+                # Repeat the evoked data to create a longer signal (at least 5 seconds)
+                min_samples = int(info['sfreq'] * 5)
+                repetitions = int(np.ceil(min_samples / data.shape[1]))
+                repeated_data = np.tile(data, (1, repetitions))
+                
+                # Create raw object
+                raw = mne.io.RawArray(repeated_data, info)
+                return raw
+            
+            # Regular file handling for standard formats
+            elif ext == '.edf':
+                raw = mne.io.read_raw_edf(data_path, preload=True)
+            elif ext == '.bdf':
+                raw = mne.io.read_raw_bdf(data_path, preload=True)
+            elif ext in ['.fif', '.fiff']:
+                raw = mne.io.read_raw_fif(data_path, preload=True)
+            elif ext == '.vhdr':
+                raw = mne.io.read_raw_brainvision(data_path, preload=True)
+            elif ext == '.set':
+                raw = mne.io.read_raw_eeglab(data_path, preload=True)
+            else:
+                raise ValueError(f"Unsupported file format: {ext}")
+            
+            # Verify data integrity
+            if raw.n_times == 0:
+                raise ValueError("Data file contains no time points")
+            
+            if len(raw.ch_names) == 0:
+                raise ValueError("Data file contains no channels")
+            
+            # Set EEG channel types if not already set
+            if len(mne.pick_types(raw.info, eeg=True)) == 0:
+                self.logger.info("No channels marked as EEG, attempting to set channel types")
+                for ch_name in raw.ch_names:
+                    # Skip channels with obvious non-EEG names
+                    if any(non_eeg in ch_name.lower() for non_eeg in 
+                        ['stim', 'trig', 'ecg', 'eog', 'emg', 'resp']):
+                        continue
+                    raw.set_channel_types({ch_name: 'eeg'})
+            
+            self.logger.info(f"Loaded data: {len(raw.ch_names)} channels, {raw.n_times} samples at {raw.info['sfreq']} Hz")
+            return raw
+            
+        except Exception as e:
+            self.logger.error(f"Error loading file {data_path}: {e}")
+            raise ValueError(f"Failed to load data: {str(e)}")
     
     def _preprocess_data(self, raw: mne.io.Raw, parameters: Dict) -> mne.io.Raw:
         """
@@ -366,14 +413,45 @@ class EEGProcessingAgent:
         }
         
         # Calculate power spectral density
-        psds, freqs = mne.time_frequency.psd_welch(
-            raw, 
-            fmin=0.5, 
-            fmax=100, 
-            n_fft=int(raw.info['sfreq'] * 2),
-            n_overlap=int(raw.info['sfreq']),
-            n_per_seg=int(raw.info['sfreq'] * 4)
-        )
+        # Handle the API change in MNE
+        try:
+            # Try the newer MNE API first
+            psds, freqs = raw.compute_psd(
+                fmin=0.5,
+                fmax=100,
+                n_fft=int(raw.info['sfreq'] * 2),
+                n_overlap=int(raw.info['sfreq']),
+                n_per_seg=int(raw.info['sfreq'] * 4),
+                verbose=False
+            ).get_data(return_freqs=True)
+        except AttributeError:
+            # Fall back to the older API if needed
+            try:
+                from mne.time_frequency import psd_welch
+                psds, freqs = psd_welch(
+                    raw,
+                    fmin=0.5,
+                    fmax=100,
+                    n_fft=int(raw.info['sfreq'] * 2),
+                    n_overlap=int(raw.info['sfreq']),
+                    n_per_seg=int(raw.info['sfreq'] * 4),
+                    verbose=False
+                )
+            except ImportError:
+                # If all else fails, try another approach
+                from mne.time_frequency import psd_array_welch
+                data = raw.get_data()
+                sfreq = raw.info['sfreq']
+                psds, freqs = psd_array_welch(
+                    data,
+                    sfreq=sfreq,
+                    fmin=0.5,
+                    fmax=100,
+                    n_fft=int(sfreq * 2),
+                    n_overlap=int(sfreq),
+                    n_per_seg=int(sfreq * 4),
+                    verbose=False
+                )
         
         # Calculate band powers
         band_powers = {}
@@ -385,8 +463,35 @@ class EEGProcessingAgent:
             band_power = np.mean(psds[:, freq_idx], axis=1)
             band_powers[band_name] = band_power
         
+        # Calculate relative band powers
+        total_power = np.sum(list(band_powers.values()), axis=0)
+        rel_band_powers = {}
+        
+        for band_name, band_power in band_powers.items():
+            # Avoid division by zero
+            with np.errstate(divide='ignore', invalid='ignore'):
+                rel_power = band_power / total_power
+                rel_power[np.isnan(rel_power)] = 0  # Replace NaN with 0
+                rel_power[np.isinf(rel_power)] = 0  # Replace Inf with 0
+            
+            rel_band_powers[f"rel_{band_name}"] = rel_power
+        
+        # Calculate band ratios
+        ratios = {
+            "theta_beta_ratio": band_powers["theta"] / band_powers["beta"],
+            "alpha_theta_ratio": band_powers["alpha"] / band_powers["theta"],
+            "alpha_beta_ratio": band_powers["alpha"] / band_powers["beta"]
+        }
+        
+        # Set any inf or nan to 0
+        for ratio_name, ratio in ratios.items():
+            ratio[np.isnan(ratio)] = 0
+            ratio[np.isinf(ratio)] = 0
+        
         return {
             'band_powers': band_powers,
+            'relative_powers': rel_band_powers,
+            'ratios': ratios,
             'channel_names': raw.ch_names
         }
     
