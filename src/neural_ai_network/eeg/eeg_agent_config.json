@@ -1,0 +1,42 @@
+{
+    "message_broker": {
+        "host": "localhost",
+        "port": 5672,
+        "username": "guest",
+        "password": "guest",
+        "queue": "eeg_processing"
+    },
+    "preprocessing": {
+        "filter": {
+            "highpass": 1.0,
+            "lowpass": 40.0
+        },
+        "notch": 60.0,
+        "resampling_rate": 250,
+        "reference": "average",
+        "apply_ica": false
+    },
+    "analysis": {
+        "epochs": {
+            "tmin": -0.2,
+            "tmax": 1.0
+        },
+        "features": [
+            "band_power",
+            "connectivity",
+            "time_domain"
+        ],
+        "machine_learning": {
+            "enabled": false,
+            "models": ["csp_lda", "deep_learning"]
+        }
+    },
+    "storage": {
+        "processed_data": "./test_output",
+        "results": "./test_output"
+    },
+    "performance": {
+        "max_workers": 4,
+        "timeout_seconds": 3600
+    }
+}
