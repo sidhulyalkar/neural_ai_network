@@ -855,48 +855,131 @@ class EEGProcessingAgent:
         self.logger.info("Analyzing data")
         
         # Merge configuration with provided parameters
-        config = self.config["analysis"]
+        config = self.config["analysis"].copy()
         for key, value in parameters.get("analysis", {}).items():
-            config[key] = value
+            if isinstance(value, dict) and isinstance(config.get(key, {}), dict):
+                # Deep merge for nested dicts
+                config[key] = config.get(key, {})
+                for subkey, subvalue in value.items():
+                    config[key][subkey] = subvalue
+            else:
+                config[key] = value
         
         analysis_results = {}
         
         # Perform machine learning if enabled
         if config.get("machine_learning", {}).get("enabled", False):
-            # This is a placeholder for ML analysis
-            analysis_results["machine_learning"] = {
-                "model": "placeholder",
-                "performance": {
-                    "accuracy": 0.85,
-                    "f1_score": 0.84
-                }
-            }
+            try:
+                ml_results = self._apply_machine_learning(raw, features, config)
+                analysis_results["machine_learning"] = ml_results
+            except Exception as e:
+                self.logger.warning(f"Error in machine learning analysis: {e}")
+                analysis_results["machine_learning"] = {"error": str(e)}
         
         # Calculate statistical measures
-        if "band_power" in features:
+        if "bandpower" in features:
             # Simple statistical analysis of band powers
-            band_powers = features["band_power"]["band_powers"]
-            stats = {}
-            for band, powers in band_powers.items():
-                stats[band] = {
-                    "mean": float(np.mean(powers)),
-                    "std": float(np.std(powers)),
-                    "median": float(np.median(powers))
-                }
-            analysis_results["band_power_statistics"] = stats
+            try:
+                band_powers = features["bandpower"].get("band_powers", {})
+                stats = {}
+                for band, powers in band_powers.items():
+                    if isinstance(powers, (list, np.ndarray)):
+                        stats[band] = {
+                            "mean": float(np.mean(powers)),
+                            "std": float(np.std(powers)),
+                            "median": float(np.median(powers)),
+                            "min": float(np.min(powers)),
+                            "max": float(np.max(powers))
+                        }
+                analysis_results["band_power_statistics"] = stats
+            except Exception as e:
+                self.logger.warning(f"Error analyzing band powers: {e}")
         
         # Analyze connectivity if available
         if "connectivity" in features:
-            # For demonstration, we'll just compute some basic graph metrics
-            conn_matrix = features["connectivity"]["connectivity_matrix"]
+            try:
+                # Check which keys exist in the connectivity data
+                self.logger.debug(f"Connectivity keys: {features['connectivity'].keys()}")
+                
+                # Extract connectivity matrices - handling different possible structures
+                conn_matrices = None
+                
+                # Try different possible keys
+                if "connectivity_matrices" in features["connectivity"]:
+                    conn_matrices = features["connectivity"]["connectivity_matrices"]
+                elif "connectivity_matrix" in features["connectivity"]:
+                    conn_matrices = features["connectivity"]["connectivity_matrix"]
+                elif "matrices" in features["connectivity"]:
+                    conn_matrices = features["connectivity"]["matrices"]
+                else:
+                    # Create a simple structure from whatever is available
+                    conn_matrices = {}
+                    for key, value in features["connectivity"].items():
+                        if key not in ["method", "channel_names", "network_measures"] and isinstance(value, (dict, list, np.ndarray)):
+                            conn_matrices[key] = value
+                
+                # Calculate basic graph metrics for each band
+                graph_metrics = {}
+                
+                for band, matrix in conn_matrices.items():
+                    if isinstance(matrix, (list, np.ndarray)):
+                        # Convert to numpy if it's a list
+                        if isinstance(matrix, list):
+                            matrix = np.array(matrix)
+                        
+                        # Node degree (number of connections above threshold)
+                        threshold = 0.5
+                        degree = np.sum(matrix > threshold, axis=0)
+                        
+                        # Node strength (sum of connection weights)
+                        strength = np.sum(matrix, axis=0)
+                        
+                        # Clustering coefficient (simplified)
+                        # This is just a placeholder - real graph metrics would use networkx
+                        n_channels = matrix.shape[0]
+                        clustering = np.zeros(n_channels)
+                        
+                        graph_metrics[band] = {
+                            "degree": degree.tolist(),
+                            "strength": strength.tolist(),
+                            "clustering": clustering.tolist()
+                        }
+                
+                analysis_results["connectivity_metrics"] = graph_metrics
+            except Exception as e:
+                self.logger.warning(f"Error analyzing connectivity: {e}")
+                import traceback
+                self.logger.debug(traceback.format_exc())
+        
+        # Add spectral edge frequency analysis
+        try:
+            psds, freqs = raw.compute_psd(fmin=0.5, fmax=45).get_data(return_freqs=True)
             
-            # Calculate node degree (simplified)
-            degree = np.sum(conn_matrix > 0.5, axis=0)
+            # Spectral edge frequency (frequency below which X% of power resides)
+            def spectral_edge_freq(psd, freqs, percent=0.95):
+                # Calculate cumulative PSD
+                cum_psd = np.cumsum(psd)
+                # Normalize
+                cum_psd = cum_psd / cum_psd[-1] if cum_psd[-1] > 0 else cum_psd
+                # Find the frequency below which percent% of power resides
+                idx = np.argmax(cum_psd >= percent)
+                return freqs[idx] if idx < len(freqs) else freqs[-1]
             
-            analysis_results["connectivity_metrics"] = {
-                "degree": degree.tolist(),
-                "channel_names": features["connectivity"]["channel_names"]
+            # Calculate SEF for each channel
+            sef90 = np.zeros(len(raw.ch_names))
+            sef95 = np.zeros(len(raw.ch_names))
+            
+            for i in range(len(raw.ch_names)):
+                sef90[i] = spectral_edge_freq(psds[i], freqs, 0.9)
+                sef95[i] = spectral_edge_freq(psds[i], freqs, 0.95)
+            
+            analysis_results["spectral_edge_frequency"] = {
+                "sef90": sef90.tolist(),
+                "sef95": sef95.tolist(),
+                "channel_names": raw.ch_names
             }
+        except Exception as e:
+            self.logger.warning(f"Error calculating spectral edge frequency: {e}")
         
         return analysis_results
     
