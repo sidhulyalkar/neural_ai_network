@@ -496,14 +496,14 @@ class EEGProcessingAgent:
         
         try:
             # First try the newer location
-            from mne.connectivity import spectral_connectivity_epochs
+            from mne_connectivity import spectral_connectivity_epochs
         except ImportError:
             # Fall back to the older location
             try:
-                from mne.connectivity import spectral_connectivity as spectral_connectivity_epochs
+                from mne_connectivity import spectral_connectivity as spectral_connectivity_epochs
             except ImportError:
                 # If all else fails, use a very old version
-                from mne.connectivity import spectral_connectivity
+                from mne_connectivity import spectral_connectivity
                 def spectral_connectivity_epochs(*args, **kwargs):
                     return spectral_connectivity(*args, **kwargs)
         
