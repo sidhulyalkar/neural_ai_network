@@ -108,7 +108,7 @@ def load_data(args, logger):
 
 
 def simulate_data():
-    """Create simulated EEG data with clearly visible signals."""
+    """Create simulated EEG data with realistic inter-channel correlations."""
     # Create info object with standard 10-20 electrode positions
     ch_names = ['Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'T7', 'C3', 'Cz', 
                'C4', 'T8', 'P7', 'P3', 'Pz', 'P4', 'P8', 'O1', 'O2']
@@ -120,35 +120,57 @@ def simulate_data():
         sfreq=256
     )
     
-    # Generate 60 seconds of data with larger amplitude (50 µV baseline)
-    data = np.random.randn(len(ch_names), 256 * 60) * 50e-6  # ~50 µV
+    # Generate correlated noise between channels
+    n_samples = 256 * 60
+    n_channels = len(ch_names)
     
-    # Add more pronounced oscillations
+    # Create a base signal that will be common across channels (creating correlation)
     t = np.arange(0, 60, 1/256)
+    base_signal = np.random.randn(n_samples) * 10e-6  # Base common activity
     
-    # Add different frequencies to different channels
-    # Alpha (8-12 Hz) in occipital channels
-    alpha = np.sin(2 * np.pi * 10 * t) * 100e-6  # 100 µV
-    data[ch_names.index('O1'), :] += alpha
-    data[ch_names.index('O2'), :] += alpha
+    # Add common oscillations to increase correlation
+    alpha_common = np.sin(2 * np.pi * 10 * t) * 50e-6  # Common alpha rhythm
+    beta_common = np.sin(2 * np.pi * 20 * t) * 30e-6   # Common beta rhythm
+    theta_common = np.sin(2 * np.pi * 6 * t) * 40e-6   # Common theta rhythm
     
-    # Beta (13-30 Hz) in frontal channels
-    beta = np.sin(2 * np.pi * 20 * t) * 50e-6  # 50 µV
-    data[ch_names.index('F3'), :] += beta
-    data[ch_names.index('F4'), :] += beta
+    base_signal += alpha_common + beta_common + theta_common
     
-    # Theta (4-7 Hz) in temporal channels
-    theta = np.sin(2 * np.pi * 6 * t) * 75e-6  # 75 µV
-    data[ch_names.index('T7'), :] += theta
-    data[ch_names.index('T8'), :] += theta
+    # Generate data with base signal plus unique components
+    data = np.zeros((n_channels, n_samples))
     
-    # Add some 60 Hz noise
-    line_noise = np.sin(2 * np.pi * 60 * t) * 20e-6  # 20 µV
+    for i in range(n_channels):
+        # Add common signal (ensures correlation)
+        data[i, :] = base_signal.copy()
+        
+        # Add unique random component (reduced amplitude)
+        unique_component = np.random.randn(n_samples) * 20e-6
+        data[i, :] += unique_component
+    
+    # Add more pronounced unique oscillations to specific regions
+    # Frontal alpha
+    frontal_alpha = np.sin(2 * np.pi * 10 * t) * 40e-6
+    data[ch_names.index('Fp1'), :] += frontal_alpha
+    data[ch_names.index('Fp2'), :] += frontal_alpha
+    
+    # Occipital alpha (stronger)
+    occipital_alpha = np.sin(2 * np.pi * 10 * t) * 80e-6
+    data[ch_names.index('O1'), :] += occipital_alpha
+    data[ch_names.index('O2'), :] += occipital_alpha
+    
+    # Temporal theta
+    temporal_theta = np.sin(2 * np.pi * 6 * t) * 60e-6
+    data[ch_names.index('T7'), :] += temporal_theta
+    data[ch_names.index('T8'), :] += temporal_theta
+    
+    # Central beta
+    central_beta = np.sin(2 * np.pi * 20 * t) * 30e-6
+    data[ch_names.index('C3'), :] += central_beta
+    data[ch_names.index('C4'), :] += central_beta
+    data[ch_names.index('Cz'), :] += central_beta
+    
+    # Add line noise (less prominent)
+    line_noise = np.sin(2 * np.pi * 60 * t) * 10e-6
     data += line_noise
-    
-    # Add a slow drift to some channels
-    drift = np.sin(2 * np.pi * 0.1 * t) * 200e-6  # 200 µV very slow wave
-    data[ch_names.index('Cz'), :] += drift
     
     # Create raw object
     raw = mne.io.RawArray(data, info)
@@ -433,26 +455,46 @@ def visualize_results(result, output_dir, save_plots=False):
         print(f"Error displaying features: {e}")
     
     # Create and save visualizations
+# In the visualize_results function, add this at the beginning of the save_plots section:
     if save_plots:
         try:
             os.makedirs(output_dir, exist_ok=True)
             
-            # Plot channel data if available
-            if "raw_data" in result:
-                try:
-                    plt.figure(figsize=(12, 8))
-                    result["raw_data"].copy().crop(0, min(10, result["raw_data"].times[-1])).plot(
-                        n_channels=min(16, len(result["raw_data"].ch_names)), 
-                        scalings='auto', 
-                        title="Preprocessed EEG Data (first 10s)",
-                        show=False
-                    )
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, "preprocessed_eeg.png"))
-                    plt.close()
-                    print(f"\nSaved preprocessed EEG plot to {os.path.join(output_dir, 'preprocessed_eeg.png')}")
-                except Exception as e:
-                    print(f"Error creating raw data plot: {e}")
+            # Save a summary text file
+            summary_path = os.path.join(output_dir, "processing_summary.txt")
+            with open(summary_path, 'w') as f:
+                f.write("EEG PROCESSING SUMMARY\n")
+                f.write("=====================\n\n")
+                
+                # Write basic information
+                if "raw_info" in result:
+                    f.write("ORIGINAL DATA:\n")
+                    raw_info = result["raw_info"]
+                    f.write(f"- Channels: {raw_info.get('n_channels', 'N/A')}\n")
+                    f.write(f"- Duration: {raw_info.get('duration', 'N/A'):.1f} seconds\n")
+                    f.write(f"- Sampling rate: {raw_info.get('sfreq', 'N/A')} Hz\n\n")
+                
+                # Write processing steps
+                if "processing_steps" in result:
+                    f.write("PROCESSING STEPS:\n")
+                    for i, step in enumerate(result["processing_steps"]):
+                        if isinstance(step, dict) and "step" in step:
+                            f.write(f"{i+1}. {step['step'].upper()}\n")
+                            if "info" in step and isinstance(step["info"], dict):
+                                for key, value in step["info"].items():
+                                    f.write(f"   - {key}: {value}\n")
+                            f.write("\n")
+            
+                # Write feature information
+                if "features" in result:
+                    f.write("EXTRACTED FEATURES:\n")
+                    for feature_type in result["features"].keys():
+                        f.write(f"- {feature_type.upper()}\n")
+                    f.write("\n")
+                
+                f.write("See plots and other files in this directory for detailed results.\n")
+        
+            print(f"\nSaved processing summary to {summary_path}")
             
             # Plot epochs if available
             if "epoch_data" in result:

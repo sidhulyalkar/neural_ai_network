@@ -315,8 +315,31 @@ class EEGPreprocessor:
             result_file = os.path.join(self.config.interim_dir, f"{file_id}_result.json")
             # Remove raw data from result to make it JSON serializable
             json_result = {k: v for k, v in result.items() if k != 'raw_data' and k != 'epoch_data'}
+            
+            # Convert NumPy arrays to lists for JSON serialization
+            def convert_numpy_to_python(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, dict):
+                    return {key: convert_numpy_to_python(value) for key, value in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numpy_to_python(item) for item in obj]
+                elif isinstance(obj, np.integer):
+                    return int(obj)
+                elif isinstance(obj, np.floating):
+                    return float(obj)
+                elif isinstance(obj, np.bool_):
+                    return bool(obj)
+                else:
+                    return obj
+            
+            # Convert all NumPy types to Python native types
+            json_result = convert_numpy_to_python(json_result)
+    
+            # Now save to JSON
             with open(result_file, 'w') as f:
                 json.dump(json_result, f, indent=2)
+            self._save_interim(raw, file_id, "00_raw")
         
         # Add data to result
         if epochs is not None:
@@ -401,6 +424,15 @@ class EEGPreprocessor:
             for i, mean_corr in enumerate(mean_corrs):
                 if mean_corr < self.config.bad_channel_threshold:
                     bad_channels.append(ch_names[i])
+            
+            # Safety check: don't mark all channels as bad
+            if len(bad_channels) >= len(ch_names) * 0.7:  # If more than 70% marked as bad
+                self.logger.warning(f"Too many channels ({len(bad_channels)}/{len(ch_names)}) marked as bad. Using only the worst 30%.")
+                
+                # Sort channels by correlation and take only the worst 30%
+                sorted_indices = np.argsort(mean_corrs)
+                worst_indices = sorted_indices[:int(len(ch_names) * 0.3)]
+                bad_channels = [ch_names[i] for i in worst_indices]
         
         elif self.config.bad_channel_criteria == "amplitude":
             # Amplitude-based detection
@@ -480,38 +512,65 @@ class EEGPreprocessor:
         # Copy to avoid modifying original
         raw = raw.copy()
         
-        if self.config.reference == "average":
-            # Average reference
-            raw.set_eeg_reference("average", verbose=False)
-            ref_info = {"type": "average"}
-        elif self.config.reference == "mastoids":
-            # Mastoid reference (try various naming conventions)
-            mastoid_candidates = ["M1", "M2", "A1", "A2", "TP9", "TP10", "P9", "P10"]
-            available_mastoids = [ch for ch in mastoid_candidates if ch in raw.ch_names]
+        # First, verify there are EEG channels
+        eeg_picks = mne.pick_types(raw.info, eeg=True)
+        
+        if len(eeg_picks) == 0:
+            # No channels marked as EEG, try to mark them
+            self.logger.warning("No channels marked as EEG, marking all channels as EEG")
+            for ch_name in raw.ch_names:
+                # Skip any channels that are clearly not EEG
+                if ch_name.lower() in ['stim', 'ecg', 'eog']:
+                    continue
+                raw.set_channel_types({ch_name: 'eeg'})
             
-            if len(available_mastoids) >= 1:
-                ref_info = {"type": "mastoid", "channels": available_mastoids}
-                raw.set_eeg_reference(available_mastoids, verbose=False)
+            # Check again
+            eeg_picks = mne.pick_types(raw.info, eeg=True)
+            
+            if len(eeg_picks) == 0:
+                # Still no EEG channels, can't proceed with referencing
+                self.logger.error("Could not identify any EEG channels, skipping referencing")
+                return raw, {"type": "none", "reason": "no EEG channels identified"}
+        
+        # Try-except block to catch any referencing errors
+        try:
+            if self.config.reference == "average":
+                # Average reference
+                raw.set_eeg_reference("average", verbose=False)
+                ref_info = {"type": "average"}
+            elif self.config.reference == "mastoids":
+                # Mastoid reference (try various naming conventions)
+                mastoid_candidates = ["M1", "M2", "A1", "A2", "TP9", "TP10", "P9", "P10"]
+                available_mastoids = [ch for ch in mastoid_candidates if ch in raw.ch_names]
+                
+                if len(available_mastoids) >= 1:
+                    ref_info = {"type": "mastoid", "channels": available_mastoids}
+                    raw.set_eeg_reference(available_mastoids, verbose=False)
+                else:
+                    self.logger.warning("No mastoid channels found, falling back to average")
+                    raw.set_eeg_reference("average", verbose=False)
+                    ref_info = {"type": "average", "fallback": True}
+            elif isinstance(self.config.reference, list):
+                # Custom reference channels
+                available_refs = [ch for ch in self.config.reference if ch in raw.ch_names]
+                
+                if len(available_refs) >= 1:
+                    ref_info = {"type": "custom", "channels": available_refs}
+                    raw.set_eeg_reference(available_refs, verbose=False)
+                else:
+                    self.logger.warning("No specified reference channels found, falling back to average")
+                    raw.set_eeg_reference("average", verbose=False)
+                    ref_info = {"type": "average", "fallback": True}
             else:
-                self.logger.warning("No mastoid channels found, falling back to average")
+                # Invalid reference type, use average
+                self.logger.warning(f"Invalid reference type: {self.config.reference}, using average")
                 raw.set_eeg_reference("average", verbose=False)
                 ref_info = {"type": "average", "fallback": True}
-        elif isinstance(self.config.reference, list):
-            # Custom reference channels
-            available_refs = [ch for ch in self.config.reference if ch in raw.ch_names]
-            
-            if len(available_refs) >= 1:
-                ref_info = {"type": "custom", "channels": available_refs}
-                raw.set_eeg_reference(available_refs, verbose=False)
-            else:
-                self.logger.warning("No specified reference channels found, falling back to average")
-                raw.set_eeg_reference("average", verbose=False)
-                ref_info = {"type": "average", "fallback": True}
-        else:
-            # Invalid reference type, use average
-            self.logger.warning(f"Invalid reference type: {self.config.reference}, using average")
-            raw.set_eeg_reference("average", verbose=False)
-            ref_info = {"type": "average", "fallback": True}
+        except Exception as e:
+            # If referencing fails, log it and continue without referencing
+            self.logger.error(f"Error applying reference: {e}")
+            self.logger.info("Continuing without reference")
+            ref_info = {"type": "none", "error": str(e)}
         
         return raw, ref_info
     
@@ -537,13 +596,12 @@ class EEGPreprocessor:
         for ch_idx in range(data.shape[0]):
             # Amplitude threshold detection
             over_threshold = np.abs(data[ch_idx]) > amplitude_threshold
-            
+
+            # Extend segments to include nearby samples (100 ms before and after)
+            extension = int(0.1 * sfreq)
             # Find segments where amplitude threshold is exceeded
             if np.any(over_threshold):
-                # Extend segments to include nearby samples (100 ms before and after)
-                extension = int(0.1 * sfreq)
                 extended = np.zeros_like(over_threshold)
-                
                 for i in range(len(over_threshold)):
                     if over_threshold[i]:
                         start = max(0, i - extension)
@@ -874,30 +932,62 @@ class EEGPreprocessor:
         # Get frequency bands
         bands = self.config.bands
         
-        # Calculate PSDs
+        # Calculate appropriate FFT length
         if is_epochs:
-            psds, freqs = mne.time_frequency.psd_welch(
-                data_obj,
-                fmin=min([band[0] for band in bands.values()]),
-                fmax=max([band[1] for band in bands.values()]),
-                n_fft=int(data_obj.info['sfreq'] * 2),
-                n_overlap=int(data_obj.info['sfreq']),
-                average='mean'
-            )
+            # For epochs, check the length of each epoch
+            n_times = data_obj.get_data().shape[2]
         else:
-            psds, freqs = mne.time_frequency.psd_welch(
-                data_obj,
-                fmin=min([band[0] for band in bands.values()]),
-                fmax=max([band[1] for band in bands.values()]),
-                n_fft=int(data_obj.info['sfreq'] * 2),
-                n_overlap=int(data_obj.info['sfreq'])
-            )
+            # For raw data, use a longer segment
+            n_times = min(int(data_obj.info['sfreq'] * 4), data_obj.get_data().shape[1])
+        
+        # Make sure n_fft is not larger than n_times
+        n_fft = min(int(data_obj.info['sfreq'] * 2), n_times)
+        n_overlap = min(int(n_fft * 0.5), n_times - 1)
+        
+        self.logger.info(f"Using n_fft={n_fft}, n_times={n_times}, n_overlap={n_overlap}")
+        
+        # Calculate PSDs using newer MNE API
+        try:
+            if is_epochs:
+                # For epochs
+                psds, freqs = data_obj.compute_psd(
+                    method='welch',
+                    fmin=min([band[0] for band in bands.values()]),
+                    fmax=max([band[1] for band in bands.values()]),
+                    n_fft=n_fft,
+                    n_overlap=n_overlap
+                ).get_data(return_freqs=True)
+            else:
+                # For raw data
+                psds, freqs = data_obj.compute_psd(
+                    method='welch',
+                    fmin=min([band[0] for band in bands.values()]),
+                    fmax=max([band[1] for band in bands.values()]),
+                    n_fft=n_fft,
+                    n_overlap=n_overlap
+                ).get_data(return_freqs=True)
+        except Exception as e:
+            self.logger.error(f"Error computing PSD: {e}")
+            # Return empty results as fallback
+            return {
+                "error": str(e),
+                "channel_names": data_obj.ch_names
+            }
         
         # Calculate band powers
         band_powers = {}
         for band_name, (fmin, fmax) in bands.items():
             # Find frequencies in band
             freq_idx = np.logical_and(freqs >= fmin, freqs <= fmax)
+            
+            # Handle empty frequency range
+            if not np.any(freq_idx):
+                self.logger.warning(f"No frequencies found in band {band_name} ({fmin}-{fmax} Hz)")
+                if is_epochs:
+                    band_powers[band_name] = np.zeros((psds.shape[0], psds.shape[1]))
+                else:
+                    band_powers[band_name] = np.zeros(psds.shape[0])
+                continue
             
             # Calculate average power in band for each channel/epoch
             if is_epochs:
@@ -1354,7 +1444,7 @@ class EEGPreprocessor:
 # Example usage
 if __name__ == "__main__":
     import sys
-    from eeg_data_loader import EEGDataLoader
+    from neural_ai_network.eeg.data_loader import EEGDataLoader
     
     # Initialize
     loader = EEGDataLoader()
