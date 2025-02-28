@@ -413,6 +413,159 @@ class EEGProcessingAgent:
             'measure': 'correlation',
             'channel_names': raw.ch_names
         }
+    def _extract_erp_features_with_time_warp(self, raw: mne.io.Raw, config: Dict) -> Dict:
+        """
+        Extract ERP-like features from continuous EEG data using time warping.
+        
+        This method implements a simplified version of the approach described in
+        "Time-warp invariant neural discovery" (Gao et al., Stanford, 2019)
+        to find stereotyped patterns without explicit event markers.
+        
+        Args:
+            raw: MNE Raw object with continuous EEG data
+            config: Configuration parameters
+            
+        Returns:
+            Dictionary of detected patterns and their properties
+        """
+        self.logger.info("Extracting ERP features using time warping")
+        
+        # Get data and parameters
+        data = raw.get_data()
+        sfreq = raw.info['sfreq']
+        ch_names = raw.ch_names
+        
+        # Parameters for time warping
+        window_size = config.get('window_size', int(1.0 * sfreq))  # 1 second window
+        stride = config.get('stride', int(0.1 * sfreq))  # 100ms stride
+        max_warp_factor = config.get('max_warp_factor', 0.2)  # Maximum time warping (20%)
+        n_components = config.get('n_components', 3)  # Number of components to extract
+        
+        # 1. Extract overlapping windows from the data
+        windows = []
+        timestamps = []
+        n_channels, n_samples = data.shape
+        
+        for start in range(0, n_samples - window_size, stride):
+            end = start + window_size
+            windows.append(data[:, start:end])
+            timestamps.append(start / sfreq)
+        
+        # Convert to array
+        windows = np.array(windows)  # shape: (n_windows, n_channels, window_size)
+        
+        # 2. Apply dimensionality reduction to windows (PCA or other methods)
+        from sklearn.decomposition import PCA
+        
+        # Reshape windows for PCA
+        n_windows, n_ch, n_time = windows.shape
+        windows_reshaped = windows.reshape(n_windows, n_ch * n_time)
+        
+        # Apply PCA
+        pca = PCA(n_components=n_components)
+        components = pca.fit_transform(windows_reshaped)
+        
+        # 3. Cluster similar windows (optional - for multiple pattern types)
+        from sklearn.cluster import KMeans
+        
+        n_clusters = config.get('n_clusters', 2)  # Number of pattern types to discover
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        clusters = kmeans.fit_predict(components)
+        
+        # 4. For each cluster, find the average pattern
+        patterns = []
+        pattern_scores = []
+        
+        for cluster_id in range(n_clusters):
+            # Get windows belonging to this cluster
+            cluster_windows = windows[clusters == cluster_id]
+            
+            if len(cluster_windows) > 0:
+                # Compute average pattern
+                avg_pattern = np.mean(cluster_windows, axis=0)
+                
+                # Calculate a score for each detection (correlation with average)
+                scores = []
+                for window in cluster_windows:
+                    # Calculate correlation for each channel
+                    channel_corrs = []
+                    for ch in range(n_channels):
+                        corr = np.corrcoef(window[ch], avg_pattern[ch])[0, 1]
+                        channel_corrs.append(corr)
+                    scores.append(np.mean(channel_corrs))
+                
+                patterns.append(avg_pattern)
+                pattern_scores.append(scores)
+        
+        # 5. Create time series of pattern occurrences (similar to an event stream)
+        event_times = []
+        event_types = []
+        event_scores = []
+        
+        for cluster_id in range(n_clusters):
+            cluster_indices = np.where(clusters == cluster_id)[0]
+            cluster_scores = pattern_scores[cluster_id]
+            
+            for idx, score in zip(cluster_indices, cluster_scores):
+                event_times.append(timestamps[idx])
+                event_types.append(cluster_id)
+                event_scores.append(score)
+        
+        # 6. Create ERP-like averages around each detected pattern
+        erp_data = {}
+        
+        for cluster_id in range(n_clusters):
+            # Get events for this cluster
+            cluster_events = [i for i, t in enumerate(event_types) if t == cluster_id]
+            
+            if cluster_events:
+                # Create synthetic events for MNE
+                event_samples = [int(event_times[i] * sfreq) for i in cluster_events]
+                event_scores_cluster = [event_scores[i] for i in cluster_events]
+                
+                # Filter events that are too close to edges
+                valid_events = []
+                for sample in event_samples:
+                    if sample >= window_size // 2 and sample < n_samples - window_size // 2:
+                        valid_events.append(sample)
+                
+                if valid_events:
+                    # Create MNE events array
+                    mne_events = np.array([
+                        [sample, 0, cluster_id + 1] for sample in valid_events
+                    ])
+                    
+                    # Create epochs
+                    try:
+                        epochs = mne.Epochs(
+                            raw, 
+                            mne_events, 
+                            event_id={f'pattern_{cluster_id}': cluster_id + 1},
+                            tmin=-0.2, 
+                            tmax=0.8,
+                            baseline=(-0.2, 0), 
+                            preload=True
+                        )
+                        
+                        # Average epochs to get ERP
+                        evoked = epochs.average()
+                        
+                        erp_data[f'pattern_{cluster_id}'] = {
+                            'times': evoked.times.tolist(),
+                            'evoked_data': evoked.data.tolist(),
+                            'channel_names': evoked.ch_names,
+                            'occurrence_times': event_times,
+                            'scores': event_scores_cluster,
+                            'pattern_template': patterns[cluster_id].tolist()
+                        }
+                    except Exception as e:
+                        self.logger.warning(f"Error creating epochs for pattern {cluster_id}: {e}")
+        
+        return {
+            'patterns_found': len(erp_data),
+            'pattern_data': erp_data,
+            'method': 'time_warp_invariant'
+        }
     
     def _extract_erp_features(self, raw: mne.io.Raw, epochs_config: Dict) -> Dict:
         """
@@ -425,27 +578,63 @@ class EEGProcessingAgent:
         Returns:
             Dictionary of ERP features
         """
-        # This is a placeholder. In a real implementation, you would
-        # need event information to create meaningful epochs.
-        
-        # For demonstration, we'll create mock events at regular intervals
-        sfreq = raw.info['sfreq']
-        events = mne.make_fixed_length_events(raw, id=1, duration=1.0)
-        
-        # Create epochs
-        tmin = epochs_config.get('tmin', -0.2)
-        tmax = epochs_config.get('tmax', 1.0)
-        epochs = mne.Epochs(raw, events, tmin=tmin, tmax=tmax, baseline=(tmin, 0), preload=True)
-        
-        # Average epochs to get ERP
-        evoked = epochs.average()
-        
-        return {
-            'times': evoked.times,
-            'evoked_data': evoked.data,
-            'channel_names': evoked.ch_names
-        }
+        # Check if events are explicitly provided in the config
+        if 'events' in epochs_config and epochs_config['events'] is not None:
+            # Use traditional event-based ERP extraction
+            events = epochs_config['events']
+            
+            # Create epochs
+            tmin = epochs_config.get('tmin', -0.2)
+            tmax = epochs_config.get('tmax', 1.0)
+            epochs = mne.Epochs(raw, events, tmin=tmin, tmax=tmax, baseline=(tmin, 0), preload=True)
+            
+            # Average epochs to get ERP
+            evoked = epochs.average()
+            
+            return {
+                'times': evoked.times.tolist(),
+                'evoked_data': evoked.data.tolist(),
+                'channel_names': evoked.ch_names,
+                'method': 'event_based'
+            }
+        else:
+            # No events provided, use time warping approach
+            return self._extract_erp_features_with_time_warp(raw, epochs_config)
     
+    # eeg_agent.py (key methods)
+
+    def analyze_features(self, features):
+        """
+        Analyze extracted EEG features and provide interpretation.
+        
+        Args:
+            features: Dictionary of features from the preprocessing pipeline
+            
+        Returns:
+            String with analysis and interpretation
+        """
+        # Implement feature analysis here
+        # This could use simple rules, statistical analysis, or ML models
+        
+        # For now, return a placeholder analysis
+        return "Feature analysis goes here"
+
+    def analyze_band_activity(self, band_powers, band="alpha"):
+        """
+        Analyze activity in a specific frequency band.
+        
+        Args:
+            band_powers: Dictionary of band power features
+            band: Frequency band to analyze (e.g., "alpha", "beta")
+            
+        Returns:
+            String with analysis of the band activity
+        """
+        # Implement band-specific analysis here
+        
+        # For now, return a placeholder analysis
+        return f"{band.capitalize()} band analysis goes here"
+
     def _analyze_data(self, raw: mne.io.Raw, features: Dict, parameters: Dict) -> Dict:
         """
         Analyze the preprocessed data and extracted features.
