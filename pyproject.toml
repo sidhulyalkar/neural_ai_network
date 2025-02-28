@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A network of AI agents for neural data analysis"
 readme = "README.md"
 authors = [
-    {name = "Neural AI Network Team", email = "contact@example.com"}
+    {name = "Sid Hulyalkar", email = "sid.soccer.21@gmail.com"}
 ]
 license = {text = "MIT"}
 classifiers = [
@@ -65,8 +65,8 @@ fmri = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/neural_ai_network"
-"Bug Tracker" = "https://github.com/yourusername/neural_ai_network/issues"
+"Homepage" = "https://github.com/sidhulyalkar/neural_ai_network"
+"Bug Tracker" = "https://github.com/sidhulyalkar/neural_ai_network/issues"
 "Documentation" = "https://neural-ai-network.readthedocs.io"
 
 [project.scripts]
