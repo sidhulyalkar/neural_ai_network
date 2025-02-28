@@ -413,30 +413,46 @@ class EEGProcessingAgent:
             'gamma': (30, 100)
         }
         
-        # In MNE 1.9.0, these functions are available in mne.time_frequency.spectrum
-        from mne.time_frequency.spectrum import psd_array_welch
-        
-        # Get the raw data as NumPy array
-        data = raw.get_data()
-        sfreq = raw.info['sfreq']
-        
-        # Calculate power spectral density using psd_array_welch
-        psds, freqs = psd_array_welch(
-            data,
-            sfreq=sfreq,
-            fmin=0.5,
-            fmax=100,
-            n_fft=int(sfreq * 2),
-            n_overlap=int(sfreq),
-            n_per_seg=int(sfreq * 4),
-            verbose=False
-        )
+        try:
+            # Try using the newer API
+            psds, freqs = raw.compute_psd(
+                fmin=0.5,
+                fmax=100,
+                verbose=False
+            ).get_data(return_freqs=True)
+        except Exception as e:
+            self.logger.warning(f"Error with compute_psd: {e}")
+            
+            # Fall back to using time_frequency functions
+            try:
+                from mne.time_frequency import psd_array_welch
+                data = raw.get_data()
+                sfreq = raw.info['sfreq']
+                psds, freqs = psd_array_welch(
+                    data,
+                    sfreq=sfreq,
+                    fmin=0.5,
+                    fmax=100,
+                    verbose=False
+                )
+            except Exception as e2:
+                self.logger.error(f"Failed to calculate PSDs: {e2}")
+                # Return empty results
+                return {
+                    'band_powers': {},
+                    'channel_names': raw.ch_names
+                }
         
         # Calculate band powers
         band_powers = {}
         for band_name, (fmin, fmax) in bands.items():
             # Find frequencies in band
             freq_idx = np.logical_and(freqs >= fmin, freqs <= fmax)
+            
+            # Check if we have any frequencies in this band
+            if not np.any(freq_idx):
+                band_powers[band_name] = np.zeros(psds.shape[0])
+                continue
             
             # Calculate average power in band for each channel
             band_power = np.mean(psds[:, freq_idx], axis=1)
@@ -456,21 +472,23 @@ class EEGProcessingAgent:
             rel_band_powers[f"rel_{band_name}"] = rel_power
         
         # Calculate band ratios
-        ratios = {
-            "theta_beta_ratio": band_powers["theta"] / band_powers["beta"],
-            "alpha_theta_ratio": band_powers["alpha"] / band_powers["theta"],
-            "alpha_beta_ratio": band_powers["alpha"] / band_powers["beta"]
-        }
-        
-        # Set any inf or nan to 0
-        for ratio_name, ratio in ratios.items():
-            ratio[np.isnan(ratio)] = 0
-            ratio[np.isinf(ratio)] = 0
+        ratios = {}
+        try:
+            ratios["theta_beta_ratio"] = band_powers["theta"] / band_powers["beta"]
+            ratios["alpha_theta_ratio"] = band_powers["alpha"] / band_powers["theta"]
+            ratios["alpha_beta_ratio"] = band_powers["alpha"] / band_powers["beta"]
+            
+            # Set any inf or nan to 0
+            for ratio_name, ratio in ratios.items():
+                ratio[np.isnan(ratio)] = 0
+                ratio[np.isinf(ratio)] = 0
+        except Exception as e:
+            self.logger.warning(f"Error calculating ratios: {e}")
         
         return {
             'band_powers': band_powers,
             'relative_powers': rel_band_powers,
-            'ratios': ratios,
+            'ratios': ratios if ratios else {},
             'channel_names': raw.ch_names
         }
 
