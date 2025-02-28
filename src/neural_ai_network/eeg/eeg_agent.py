@@ -474,6 +474,7 @@ class EEGProcessingAgent:
             'channel_names': raw.ch_names
         }
 
+
     def _extract_connectivity(self, raw: mne.io.Raw) -> Dict:
         """
         Extract connectivity features from EEG data.
@@ -493,8 +494,18 @@ class EEGProcessingAgent:
             'gamma': (30, 45)
         }
         
-        # In MNE 1.9.0, spectral_connectivity is in a different location
-        from mne.connectivity import spectral_connectivity_epochs
+        try:
+            # First try the newer location
+            from mne.connectivity import spectral_connectivity_epochs
+        except ImportError:
+            # Fall back to the older location
+            try:
+                from mne.connectivity import spectral_connectivity as spectral_connectivity_epochs
+            except ImportError:
+                # If all else fails, use a very old version
+                from mne.connectivity import spectral_connectivity
+                def spectral_connectivity_epochs(*args, **kwargs):
+                    return spectral_connectivity(*args, **kwargs)
         
         # Create epochs for connectivity calculation
         events = mne.make_fixed_length_events(raw, duration=2.0)
@@ -509,7 +520,6 @@ class EEGProcessingAgent:
         for band_name, (fmin, fmax) in bands.items():
             try:
                 # Calculate connectivity using phase locking value (PLV)
-                # For MNE 1.9.0, the API has changed
                 con = spectral_connectivity_epochs(
                     epochs, 
                     method='plv',
