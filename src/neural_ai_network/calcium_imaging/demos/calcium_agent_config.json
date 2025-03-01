@@ -1,0 +1,43 @@
+{
+    "message_broker": {
+        "host": "localhost",
+        "port": 5672,
+        "username": "guest",
+        "password": "guest",
+        "queue": "calcium_processing"
+    },
+    "preprocessing": {
+        "spatial_filter": "gaussian",
+        "temporal_filter": "savgol",
+        "motion_correction": "ecc",
+        "background_removal": "percentile",
+        "spatial_filter_size": 3,
+        "temporal_window": 7,
+        "savgol_order": 3,
+        "max_shifts": [20, 20],
+        "background_percentile": 10.0,
+        "rolling_ball_radius": 50
+    },
+    "cell_detection": {
+        "method": "watershed",
+        "min_cell_size": 30,
+        "max_cell_size": 500,
+        "threshold": 1.5,
+        "min_distance": 10
+    },
+    "signal_extraction": {
+        "roi_expansion": 2,
+        "neuropil_correction": true,
+        "baseline_percentile": 20.0
+    },
+    "event_detection": {
+        "threshold_std": 2.5,
+        "min_duration": 2
+    },
+    "storage": {
+        "save_interim": true,
+        "interim_dir": "./data/interim/calcium",
+        "processed_dir": "./data/processed/calcium",
+        "results_dir": "./data/results/calcium"
+    }
+}
